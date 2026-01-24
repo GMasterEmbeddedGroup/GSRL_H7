@@ -435,7 +435,7 @@ void ET08ARemoteControl::updateEvent()
             m_switchSD = SwitchStatus2Pos::SWITCH_DOWN;
         }
     }
-    m_eventSC      = judgeSwitchEvent(m_switchSC, m_lastSwitchSC);
+    m_eventSC = judgeSwitchEvent(m_switchSC, m_lastSwitchSC);
     m_eventSD = judgeSwitchEvent(m_switchSD, m_lastSwitchSD);
 }
 

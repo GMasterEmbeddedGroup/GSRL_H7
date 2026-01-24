@@ -12,7 +12,8 @@
  */
 /* Includes ------------------------------------------------------------------*/
 #include "dvc_motor.hpp"
-#include "drv_can.h"
+#include "dvc_remotecontrol.hpp"
+#include "dvc_imu.hpp"
 
 /* Define --------------------------------------------------------------------*/
 // PID控制器参数（所有电机共用，可根据需要为每个电机单独配置）
@@ -40,11 +41,33 @@ MotorM3508 motor_3508_1(1, &pid4); // M3508，ID=1
 MotorM3508 motor_3508_2(2, &pid5); // M3508，ID=2
 MotorM3508 motor_3508_3(3, &pid6); // M3508，ID=3
 
+// 遥控器定义（使用 UART5 接收 DR16 遥控器数据）
+Dr16RemoteControl dr16Remote(0.0f); // 0.0f = 摇杆死区
+
+// BMI088 IMU 定义
+Mahony ahrs{};
+BMI088::CalibrationInfo cali = {
+    {0.0f, 0.0f, 0.0f}, // gyroOffset
+    {0.0f, 0.0f, 0.0f}, // accelOffset
+    {0.0f, 0.0f, 0.0f},  // magnetOffset
+    {GSRLMath::Matrix33f::MatrixType::IDENTITY} // installSpinMatrix
+};
+BMI088 imu(&ahrs,
+    {&hspi2, ACCEL_CS_GPIO_Port, ACCEL_CS_Pin},
+    {&hspi2, GYRO_CS_GPIO_Port, GYRO_CS_Pin},
+    cali);
+
 /* Variables -----------------------------------------------------------------*/
+// 用于调试查看的变量
+GSRLMath::Vector3f eulerAngle;      // 欧拉角 (roll, pitch, yaw)
+GSRLMath::Vector3f accelData;       // 加速度计数据
+GSRLMath::Vector3f gyroData;        // 陀螺仪数据
+const fp32* quaternion;             // 四元数指针
 
 /* Function prototypes -------------------------------------------------------*/
 extern "C" void can1RxCallback(can_rx_message_t *pRxMsg);
 extern "C" void can2RxCallback(can_rx_message_t *pRxMsg);
+extern "C" void uart5RxCallback(uint8_t *pData, uint16_t Size); // UART5 接收回调（DR16遥控器）
 inline void transmitMotorsControlData();
 
 /* User code -----------------------------------------------------------------*/
@@ -55,11 +78,28 @@ inline void transmitMotorsControlData();
  */
 extern "C" void test_task(void *argument)
 {
-    CAN_Init(&hfdcan1, can1RxCallback);                // 初始化CAN1
-    CAN_Init(&hfdcan2, can2RxCallback);                // 初始化CAN2
-    TickType_t taskLastWakeTime = xTaskGetTickCount(); // 获取任务开始时间
+    // 初始化 BMI088
+    bool imu_init_success = imu.init();
+
+    CAN_Init(&hfdcan1, can1RxCallback);
+    CAN_Init(&hfdcan2, can2RxCallback);
+    UART_Init(&huart5, uart5RxCallback, 36);
+
+    TickType_t taskLastWakeTime = xTaskGetTickCount();
     while (1) {
-        // 所有电机输出无力控制（开环控制值为0）
+        // BMI088 数据读取和姿态解算
+        imu.solveAttitude();  // 读取传感器数据并更新 AHRS
+
+        // 获取欧拉角 (roll, pitch, yaw) 单位:度
+        eulerAngle = imu.getEulerAngle();
+
+        // 获取加速度计和陀螺仪数据
+        accelData = imu.getAccel();
+        gyroData = imu.getGyro();
+
+        // 获取四元数 (w, x, y, z)
+        quaternion = imu.getQuaternion();
+
         motor_6020.openloopControl(0.0f);
         motor_dm4310_1.openloopControl(0.0f);
         motor_dm4310_2.openloopControl(0.0f);
@@ -67,10 +107,12 @@ extern "C" void test_task(void *argument)
         motor_3508_2.openloopControl(0.0f);
         motor_3508_3.openloopControl(0.0f);
 
-        // 发送控制数据
         transmitMotorsControlData();
 
-        vTaskDelayUntil(&taskLastWakeTime, 1); // 确保任务以定周期1ms运行
+        dr16Remote.decodeRxData();
+        dr16Remote.updateEvent();
+
+        vTaskDelayUntil(&taskLastWakeTime, 1);
     }
 }
 
@@ -96,6 +138,17 @@ extern "C" void can2RxCallback(can_rx_message_t *pRxMsg)
     motor_3508_1.decodeCanRxMessageFromISR(pRxMsg);
     motor_3508_2.decodeCanRxMessageFromISR(pRxMsg);
     motor_3508_3.decodeCanRxMessageFromISR(pRxMsg);
+}
+
+/**
+ * @brief UART5接收中断回调函数（DR16遥控器）
+ * @param pData 接收数据指针
+ * @param Size 接收数据长度
+ */
+extern "C" void uart5RxCallback(uint8_t *pData, uint16_t Size)
+{
+    // 将接收到的DR16遥控器数据传递给遥控器对象
+    dr16Remote.receiveRxDataFromISR(pData);
 }
 
 /**
