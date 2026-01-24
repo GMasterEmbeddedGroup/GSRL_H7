@@ -21,17 +21,17 @@ extern "C" {
 
 /* Includes ------------------------------------------------------------------*/
 #include "gsrl_common.h"
-#include "can.h"
+#include "fdcan.h"
 #include "cmsis_os.h"
 
 /* Exported types ------------------------------------------------------------*/
 
 /**
- * @brief CAN接收消息结构体
+ * @brief FDCAN接收消息结构体
  */
 typedef struct
 {
-    CAN_RxHeaderTypeDef header;
+    FDCAN_RxHeaderTypeDef header;
     uint8_t data[8];
 } can_rx_message_t;
 
@@ -42,23 +42,23 @@ typedef struct
 typedef void (*CAN_Call_Back)(can_rx_message_t *pRxMsg);
 
 /**
- * @brief CAN通信处理结构体
+ * @brief FDCAN通信处理结构体
  */
 typedef struct
 {
-    CAN_HandleTypeDef *hcan;
+    FDCAN_HandleTypeDef *hfdcan;
     CAN_Call_Back rxCallbackFunction;
 } CAN_Manage_Object_t;
 
 /* Exported constants --------------------------------------------------------*/
-extern osMessageQueueId_t canRxQueueHandle;
-extern CAN_Manage_Object_t s_can_manage_objects[2]; // CAN管理对象
+extern osMessageQId canRxQueueHandle;
+extern CAN_Manage_Object_t s_can_manage_objects[3]; // FDCAN管理对象
 
 /* Exported macro ------------------------------------------------------------*/
 
 /* Exported functions prototypes ---------------------------------------------*/
-void CAN_Init(CAN_HandleTypeDef *hcan, CAN_Call_Back rxCallbackFunction);
-HAL_StatusTypeDef CAN_Send_Data(CAN_HandleTypeDef *hcan, CAN_TxHeaderTypeDef *pTxHeader, uint8_t *pTxData);
+void CAN_Init(FDCAN_HandleTypeDef *hfdcan, CAN_Call_Back rxCallbackFunction);
+HAL_StatusTypeDef CAN_Send_Data(FDCAN_HandleTypeDef *hfdcan, FDCAN_TxHeaderTypeDef *pTxHeader, uint8_t *pTxData);
 
 /* Defines -----------------------------------------------------------*/
 

@@ -33,13 +33,13 @@ class Motor
 {
 protected:
     // 通信
-    uint32_t m_motorControlMessageID;         // 电机CAN控制消息ID
-    uint32_t m_motorFeedbackMessageID;        // 电机CAN反馈消息ID
-    CAN_TxHeaderTypeDef m_motorControlHeader; // 电机CAN控制消息头
-    uint8_t m_motorControlData[8];            // 电机CAN控制数据
-    uint8_t m_motorFeedbackData[8];           // 电机CAN反馈数据
-    uint8_t m_motorFeedbackSequence;          // 电机反馈数据序号, 用于中断接收离线判断
-    uint8_t m_motorLastFeedbackSequence;      // 上一次反馈数据序号
+    uint32_t m_motorControlMessageID;           // 电机CAN控制消息ID
+    uint32_t m_motorFeedbackMessageID;          // 电机CAN反馈消息ID
+    FDCAN_TxHeaderTypeDef m_motorControlHeader; // 电机CAN控制消息头
+    uint8_t m_motorControlData[8];              // 电机CAN控制数据
+    uint8_t m_motorFeedbackData[8];             // 电机CAN反馈数据
+    uint8_t m_motorFeedbackSequence;            // 电机反馈数据序号, 用于中断接收离线判断
+    uint8_t m_motorLastFeedbackSequence;        // 上一次反馈数据序号
     // 当前状态
     fp32 m_currentAngle;           // rad [0, 2PI)
     fp32 m_lastAngle;              // rad [0, 2PI)
@@ -67,7 +67,7 @@ public:
     // 通信相关
     uint32_t getMotorControlMessageID() const;  // 发给电机的控制报文 ID
     uint32_t getMotorFeedbackMessageID() const; // 电机回复的反馈报文 ID
-    const CAN_TxHeaderTypeDef *getMotorControlHeader() const;
+    const FDCAN_TxHeaderTypeDef *getMotorControlHeader() const;
     const uint8_t *getMotorControlData();
     bool decodeCanRxMessageFromQueue(const can_rx_message_t *rxMessage, uint8_t Size);
     bool decodeCanRxMessageFromISR(const can_rx_message_t *rxMessage);

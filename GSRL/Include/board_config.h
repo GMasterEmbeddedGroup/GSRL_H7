@@ -34,9 +34,10 @@ extern "C" {
 /* RTC */
 /* TIM */
 /* Connectivity -----------------------------*/
-/* CAN */
-#define USE_CAN1
-#define USE_CAN2
+/* FDCAN */
+#define USE_FDCAN1
+#define USE_FDCAN2
+#define USE_FDCAN3
 /* I2C */
 /* SPI */
 #define USE_SPI1

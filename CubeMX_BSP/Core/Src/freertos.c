@@ -46,43 +46,74 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 
+/**
+ * @brief FreeRTOS heap placed in DTCMRAM for optimal performance
+ * @note  Requires: #define configAPPLICATION_ALLOCATED_HEAP 1 in FreeRTOSConfig.h
+ * @note  Memory layout:
+ *        - DTCMRAM (0x20000000): Stack, ucHeap (FreeRTOS) - Zero-wait-state CPU access
+ *        - RAM_D1  (0x24000000): .data, .bss (Globals) - DMA accessible
+ */
+#if (configAPPLICATION_ALLOCATED_HEAP == 1)
+uint8_t ucHeap[configTOTAL_HEAP_SIZE] __attribute__((section(".rtos_heap"))) __attribute__((aligned(8)));
+#endif
+
 /* USER CODE END Variables */
-osThreadId UserTaskHandle;
-osThreadId ChassisTaskHandle;
-osThreadId GimbalTaskHandle;
-osThreadId LEDTaskHandle;
-osThreadId DetectTaskHandle;
-osThreadId RefereeTaskHandle;
+/* Definitions for tsk_test */
+osThreadId_t tsk_testHandle;
+const osThreadAttr_t tsk_test_attributes = {
+  .name = "tsk_test",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for ChassisTask */
+osThreadId_t ChassisTaskHandle;
+const osThreadAttr_t ChassisTask_attributes = {
+  .name = "ChassisTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for GimbalTask */
+osThreadId_t GimbalTaskHandle;
+const osThreadAttr_t GimbalTask_attributes = {
+  .name = "GimbalTask",
+  .stack_size = 1024 * 4,
+  .priority = (osPriority_t) osPriorityRealtime,
+};
+/* Definitions for LEDTask */
+osThreadId_t LEDTaskHandle;
+const osThreadAttr_t LEDTask_attributes = {
+  .name = "LEDTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for DetectTask */
+osThreadId_t DetectTaskHandle;
+const osThreadAttr_t DetectTask_attributes = {
+  .name = "DetectTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for RefereeTask */
+osThreadId_t RefereeTaskHandle;
+const osThreadAttr_t RefereeTask_attributes = {
+  .name = "RefereeTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 
 /* USER CODE END FunctionPrototypes */
 
-void User_Task(void const * argument);
-void Chassis_Task(void const * argument);
-void Gimbal_Task(void const * argument);
-void LED_Task(void const * argument);
-void Detect_Task(void const * argument);
-void Referee_Task(void const * argument);
+void test_task(void *argument);
+void Chassis_Task(void *argument);
+void Gimbal_Task(void *argument);
+void LED_Task(void *argument);
+void Detect_Task(void *argument);
+void Referee_Task(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
-
-/* GetIdleTaskMemory prototype (linked to static allocation support) */
-void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize );
-
-/* USER CODE BEGIN GET_IDLE_TASK_MEMORY */
-static StaticTask_t xIdleTaskTCBBuffer;
-static StackType_t xIdleStack[configMINIMAL_STACK_SIZE];
-
-void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize )
-{
-  *ppxIdleTaskTCBBuffer = &xIdleTaskTCBBuffer;
-  *ppxIdleTaskStackBuffer = &xIdleStack[0];
-  *pulIdleTaskStackSize = configMINIMAL_STACK_SIZE;
-  /* place for user code */
-}
-/* USER CODE END GET_IDLE_TASK_MEMORY */
 
 /**
   * @brief  FreeRTOS initialization
@@ -111,52 +142,50 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* definition and creation of UserTask */
-  osThreadDef(UserTask, User_Task, osPriorityNormal, 0, 512);
-  UserTaskHandle = osThreadCreate(osThread(UserTask), NULL);
+  /* creation of tsk_test */
+  tsk_testHandle = osThreadNew(test_task, NULL, &tsk_test_attributes);
 
-  /* definition and creation of ChassisTask */
-  osThreadDef(ChassisTask, Chassis_Task, osPriorityHigh, 0, 512);
-  ChassisTaskHandle = osThreadCreate(osThread(ChassisTask), NULL);
+  /* creation of ChassisTask */
+  ChassisTaskHandle = osThreadNew(Chassis_Task, NULL, &ChassisTask_attributes);
 
-  /* definition and creation of GimbalTask */
-  osThreadDef(GimbalTask, Gimbal_Task, osPriorityRealtime, 0, 1024);
-  GimbalTaskHandle = osThreadCreate(osThread(GimbalTask), NULL);
+  /* creation of GimbalTask */
+  GimbalTaskHandle = osThreadNew(Gimbal_Task, NULL, &GimbalTask_attributes);
 
-  /* definition and creation of LEDTask */
-  osThreadDef(LEDTask, LED_Task, osPriorityNormal, 0, 512);
-  LEDTaskHandle = osThreadCreate(osThread(LEDTask), NULL);
+  /* creation of LEDTask */
+  LEDTaskHandle = osThreadNew(LED_Task, NULL, &LEDTask_attributes);
 
-  /* definition and creation of DetectTask */
-  osThreadDef(DetectTask, Detect_Task, osPriorityNormal, 0, 512);
-  DetectTaskHandle = osThreadCreate(osThread(DetectTask), NULL);
+  /* creation of DetectTask */
+  DetectTaskHandle = osThreadNew(Detect_Task, NULL, &DetectTask_attributes);
 
-  /* definition and creation of RefereeTask */
-  osThreadDef(RefereeTask, Referee_Task, osPriorityAboveNormal, 0, 512);
-  RefereeTaskHandle = osThreadCreate(osThread(RefereeTask), NULL);
+  /* creation of RefereeTask */
+  RefereeTaskHandle = osThreadNew(Referee_Task, NULL, &RefereeTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
 
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
 }
 
-/* USER CODE BEGIN Header_User_Task */
+/* USER CODE BEGIN Header_test_task */
 /**
-  * @brief  Function implementing the UserTask thread.
+  * @brief  Function implementing the tsk_test thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_User_Task */
-__weak void User_Task(void const * argument)
+/* USER CODE END Header_test_task */
+__weak void test_task(void *argument)
 {
-  /* USER CODE BEGIN User_Task */
+  /* USER CODE BEGIN test_task */
   /* Infinite loop */
   for(;;)
   {
     osDelay(1);
   }
-  /* USER CODE END User_Task */
+  /* USER CODE END test_task */
 }
 
 /* USER CODE BEGIN Header_Chassis_Task */
@@ -166,7 +195,7 @@ __weak void User_Task(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_Chassis_Task */
-__weak void Chassis_Task(void const * argument)
+__weak void Chassis_Task(void *argument)
 {
   /* USER CODE BEGIN Chassis_Task */
   /* Infinite loop */
@@ -184,7 +213,7 @@ __weak void Chassis_Task(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_Gimbal_Task */
-__weak void Gimbal_Task(void const * argument)
+__weak void Gimbal_Task(void *argument)
 {
   /* USER CODE BEGIN Gimbal_Task */
   /* Infinite loop */
@@ -202,7 +231,7 @@ __weak void Gimbal_Task(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_LED_Task */
-__weak void LED_Task(void const * argument)
+__weak void LED_Task(void *argument)
 {
   /* USER CODE BEGIN LED_Task */
   /* Infinite loop */
@@ -220,7 +249,7 @@ __weak void LED_Task(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_Detect_Task */
-__weak void Detect_Task(void const * argument)
+__weak void Detect_Task(void *argument)
 {
   /* USER CODE BEGIN Detect_Task */
   /* Infinite loop */
@@ -238,7 +267,7 @@ __weak void Detect_Task(void const * argument)
 * @retval None
 */
 /* USER CODE END Header_Referee_Task */
-__weak void Referee_Task(void const * argument)
+__weak void Referee_Task(void *argument)
 {
   /* USER CODE BEGIN Referee_Task */
   /* Infinite loop */
@@ -253,3 +282,4 @@ __weak void Referee_Task(void const * argument)
 /* USER CODE BEGIN Application */
 
 /* USER CODE END Application */
+
