@@ -20,7 +20,7 @@
 /* Macro ---------------------------------------------------------------------*/
 
 /* Variables -----------------------------------------------------------------*/
-UART_Manage_Object_t s_uart_manage_objects[8] = {0}; // UART管理对象
+__attribute__((section(".dma_buffers"))) UART_Manage_Object_t s_uart_manage_objects[8] = {0}; // UART管理对象
 
 /**
  * @brief UART管理实例数组
@@ -48,8 +48,8 @@ static USART_TypeDef *const uartInstances[8] = {
 #ifdef USE_UART7
     UART7,
 #endif
-#ifdef USE_UART8
-    UART8
+#ifdef USE_UART10
+    USART10,
 #endif
 };
 

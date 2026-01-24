@@ -20,7 +20,7 @@
 /* Macro ---------------------------------------------------------------------*/
 
 /* Variables -----------------------------------------------------------------*/
-SPI_Manage_Object_t s_spi_manage_objects[6] = {0}; // SPI管理对象
+__attribute__((section(".dma_buffers"))) SPI_Manage_Object_t s_spi_manage_objects[6] = {0}; // SPI管理对象
 
 /**
  * @brief SPI管理实例数组

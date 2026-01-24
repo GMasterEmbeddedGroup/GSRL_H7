@@ -40,12 +40,13 @@ extern "C" {
 #define USE_FDCAN3
 /* I2C */
 /* SPI */
-#define USE_SPI1
+// #define USE_SPI1
 #define USE_SPI2
 /* UART */
 #define USE_USART1
-#define USE_USART3
-#define USE_USART6
+#define USE_UART5
+#define USE_UART7
+#define USE_UART10
 /* USB */
 
 #ifdef __cplusplus
