@@ -6,18 +6,13 @@ flash.cfg
 
 # dot files
 /.settings
-/.eide/log
-/.eide.usr.ctx.json
+/.claude/
 
 # project out
 /build
 /bin
 /obj
 /out
-
-# eide template
-*.ept
-*.eide-template
 
 # chip support pack
 /.pack
