@@ -14,6 +14,7 @@
 #include "dvc_motor.hpp"
 #include "dvc_remotecontrol.hpp"
 #include "dvc_imu.hpp"
+#include "drv_uart.h"
 
 /* Define --------------------------------------------------------------------*/
 // PID控制器参数（所有电机共用，可根据需要为每个电机单独配置）
@@ -42,7 +43,7 @@ MotorM3508 motor_3508_2(2, &pid5); // M3508，ID=2
 MotorM3508 motor_3508_3(3, &pid6); // M3508，ID=3
 
 // 遥控器定义（使用 UART5 接收 DR16 遥控器数据）
-Dr16RemoteControl dr16Remote(0.0f); // 0.0f = 摇杆死区
+DR16RemoteControl dr16Remote(0.0f); // 0.0f = 摇杆死区
 
 // BMI088 IMU 定义
 Mahony ahrs{};

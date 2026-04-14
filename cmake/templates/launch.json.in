@@ -24,24 +24,6 @@
                 "enabled": true,
                 "samplesPerSecond": 4
             }
-        },
-        {
-            "cwd": "${workspaceRoot}",
-            "type": "cortex-debug",
-            "request": "launch",
-            "name": "@CONFIG_PROJECT_NAME@: OpenOCD (EIDE)",
-            "servertype": "openocd",
-            "executable": "@CONFIG_ELF_PATH_EIDE@",
-            "runToEntryPoint": "main",
-            "configFiles": [
-                "interface/@CONFIG_OPENOCD_INTERFACE@",
-                "target/@CONFIG_OPENOCD_TARGET@"
-            ],
-            "toolchainPrefix": "@CONFIG_TOOLCHAIN_PREFIX_NO_DASH@",
-            "liveWatch": {
-                "enabled": true,
-                "samplesPerSecond": 4
-            }
         }
     ]
 }
