@@ -51,6 +51,59 @@
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#define BUZZER_TIM12_TICK_HZ 3960000U
+
+static void BuzzerAlarm(void)
+{
+  /* Drive PB15(TIM12_CH2) with ~550Hz, 10% PWM as a fault alarm. */
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_TIM12_CLK_ENABLE();
+
+  GPIOB->MODER &= ~(0x3UL << (15U * 2U));
+  GPIOB->MODER |= (0x2UL << (15U * 2U));
+  GPIOB->OTYPER &= ~GPIO_OTYPER_OT15;
+  GPIOB->PUPDR &= ~(0x3UL << (15U * 2U));
+  GPIOB->AFR[1] &= ~(0xFUL << ((15U - 8U) * 4U));
+  GPIOB->AFR[1] |= (0x2UL << ((15U - 8U) * 4U));
+
+  TIM12->PSC = 9U;
+  TIM12->ARR = 7199U;
+  TIM12->CCR2 = 0U;
+
+  TIM12->CCMR1 &= ~(TIM_CCMR1_CC2S | TIM_CCMR1_OC2M);
+  TIM12->CCMR1 |= (TIM_CCMR1_OC2M_1 | TIM_CCMR1_OC2M_2 | TIM_CCMR1_OC2PE);
+  TIM12->CCER |= TIM_CCER_CC2E;
+  TIM12->EGR = TIM_EGR_UG;
+  TIM12->CR1 |= (TIM_CR1_ARPE | TIM_CR1_CEN);
+}
+
+static void BuzzerSetOutput(uint16_t volumePermille, uint32_t frequencyHz)
+{
+  uint32_t periodTicks;
+  uint32_t arr;
+
+  if (volumePermille > 1000U) {
+    volumePermille = 1000U;
+  }
+
+  if (frequencyHz == 0U) {
+    TIM12->CCR2 = 0U;
+    return;
+  }
+
+  periodTicks = BUZZER_TIM12_TICK_HZ / frequencyHz;
+  if (periodTicks < 2U) {
+    periodTicks = 2U;
+  }
+  if (periodTicks > 65536U) {
+    periodTicks = 65536U;
+  }
+
+  arr = periodTicks - 1U;
+  TIM12->ARR = arr;
+  TIM12->CCR2 = ((arr + 1U) * volumePermille) / 1000U;
+  TIM12->EGR = TIM_EGR_UG;
+}
 
 /* USER CODE END 0 */
 
@@ -109,7 +162,9 @@ void NMI_Handler(void)
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
-
+ __disable_irq();
+ BuzzerAlarm(); 
+ BuzzerSetOutput(20U, 10U);
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
   {
