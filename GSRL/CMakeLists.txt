@@ -8,17 +8,17 @@ set(CMSISCORE "${CMAKE_SOURCE_DIR}/CubeMX_BSP/Drivers/CMSIS/Core")
 add_subdirectory(Dependence/CMSIS-DSP)
 add_subdirectory(Dependence/eigen)
 
-file(GLOB_RECURSE GSRL_ALGORITHM_SOURCES
+file(GLOB_RECURSE GSRL_ALGORITHM_SOURCES CONFIGURE_DEPENDS
     "Algorithm/src/*.c"
     "Algorithm/src/*.cpp"
 )
 
-file(GLOB_RECURSE GSRL_DEVICE_SOURCES
+file(GLOB_RECURSE GSRL_DEVICE_SOURCES CONFIGURE_DEPENDS
     "Device/src/*.c"
     "Device/src/*.cpp"
 )
 
-file(GLOB_RECURSE GSRL_DRIVER_SOURCES
+file(GLOB_RECURSE GSRL_DRIVER_SOURCES CONFIGURE_DEPENDS
     "Driver/src/*.c"
     "Driver/src/*.cpp"
 )
