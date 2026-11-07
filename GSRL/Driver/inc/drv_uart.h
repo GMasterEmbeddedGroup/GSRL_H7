@@ -28,12 +28,24 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 
+typedef enum
+{
+    UART_RX_EVENT_DATA,
+    UART_RX_EVENT_IDLE,
+    UART_RX_EVENT_ERROR
+} UART_RxEvent_t;
+
 /**
  * @brief UART通信接收处理回调函数类型定义
  * @param pRxData 接收数据指针
- * @param rxDataLength 接收数据长度
+ * @param rxDataLength 本段接收数据的字节数, IDLE通知允许为0
+ * @param event 接收事件, ERROR时数据指针为NULL且长度为0
+ * @note F4库(popchutty/GSRL)回调为(data, length); 本接口为(data, length, event)
+ * @note 只交付尚未交付的接收字节, 一次回调不一定是一帧; 设备接收入口须转发event
+ * @note 数据仅在回调期间有效; 同一串口的UART/DMA中断须使用相同抢占优先级
+ * @note Circular接收保留HT/TC中断, 响应及取走数据的耗时须小于半缓冲区填充时间
  */
-typedef void (*UART_Call_Back)(uint8_t *pRxData, uint16_t rxDataLength);
+typedef void (*UART_Call_Back)(uint8_t *pRxData, uint16_t rxDataLength, UART_RxEvent_t event);
 
 /**
  * @brief UART通信处理结构体
@@ -43,6 +55,7 @@ typedef struct
     UART_HandleTypeDef *huart;
     uint8_t rxBuffer[UART_BUFFER_SIZE];
     uint16_t rxDataLimit;
+    uint16_t rxReadPosition;
     UART_Call_Back rxCallbackFunction;
 } UART_Manage_Object_t;
 

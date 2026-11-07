@@ -13,6 +13,8 @@
 /* Includes ------------------------------------------------------------------*/
 #include "dvc_remotecontrol.hpp"
 #include "alg_crc.hpp"
+#include "cmsis_os.h"
+#include <cstring>
 
 /* Typedef -------------------------------------------------------------------*/
 
@@ -38,18 +40,105 @@
 RemoteControl::RemoteControl(fp32 stickDeadZone)
     : m_uartRxTimestamp(0),
       m_isConnected(false),
-      m_isDecodeCompleted(false),
-      m_stickDeadZone(stickDeadZone) {}
+      m_isEventInitialized(false),
+      m_stickDeadZone(stickDeadZone),
+      m_rxWriteIndex(0),
+      m_rxPendingIndex(1),
+      m_rxReadIndex(2),
+      m_hasRxData(false),
+      m_hasNewRxData(false),
+      m_rxInterrupted(false),
+      m_rxLength(0),
+      m_isRxSynced(false) {}
+
+/**
+ * @brief 将本段接收数据组装到写入槽, 完整帧校验通过后发布
+ * @note DR16先等待IDLE建立边界; 有帧头的协议通过滑动窗口恢复同步
+ */
+void RemoteControl::assembleRxFramesFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event,
+                                           void *rxFrames, uint16_t frameSize, RxSyncMode syncMode)
+{
+    if (event == UART_RX_EVENT_ERROR) {
+        resetRxStateFromISR();
+        return;
+    }
+    const bool syncOnIdle = syncMode == RxSyncMode::IDLE;
+    while (length != 0 && (!syncOnIdle || m_isRxSynced)) {
+        uint8_t *buffer = static_cast<uint8_t *>(rxFrames) + m_rxWriteIndex * frameSize;
+        uint16_t count = frameSize - m_rxLength;
+        if (count > length) count = length;
+        memcpy(buffer + m_rxLength, data, count);
+        m_rxLength += count;
+        data       += count;
+        length     -= count;
+        if (m_rxLength != frameSize) continue;
+
+        if (isRxFrameValid(buffer)) {
+            publishRxFrameFromISR();
+        } else if (syncOnIdle) {
+            resetRxStateFromISR();
+            break;
+        } else {
+            // 保留可能的下一帧起点, 不把DMA分段或错误帧末尾当作协议边界
+            memmove(buffer, buffer + 1, frameSize - 1);
+            m_rxLength = frameSize - 1;
+        }
+    }
+    if (syncOnIdle && event == UART_RX_EVENT_IDLE) {
+        if (m_rxLength != 0) resetRxStateFromISR();
+        m_isRxSynced = true;
+    }
+}
+
+void RemoteControl::resetRxStateFromISR()
+{
+    m_rxLength      = 0;
+    m_isRxSynced    = false;
+    m_hasRxData     = false;
+    m_hasNewRxData  = false;
+    m_rxInterrupted = true;
+}
+
+void RemoteControl::publishRxFrameFromISR()
+{
+    uint32_t timestamp = HAL_GetTick();
+    if (!m_hasRxData || timestamp - m_uartRxTimestamp > 100) m_rxInterrupted = true;
+    uint8_t previous = m_rxPendingIndex;
+    m_rxPendingIndex  = m_rxWriteIndex;
+    m_rxWriteIndex    = previous;
+    m_rxLength        = 0;
+    m_uartRxTimestamp = timestamp;
+    m_hasRxData       = true;
+    m_hasNewRxData    = true;
+}
+
+/**
+ * @brief 每轮获取最新完整帧, 临界区内只交换槽位和接收状态
+ */
+bool RemoteControl::acquireRxFrame()
+{
+    taskENTER_CRITICAL();
+    m_isConnected = m_hasRxData && HAL_GetTick() - m_uartRxTimestamp <= 100;
+    if (!m_isConnected || m_rxInterrupted) m_isEventInitialized = false;
+    m_rxInterrupted = false;
+    bool hasNewData = m_hasNewRxData;
+    if (hasNewData) {
+        uint8_t previous = m_rxReadIndex;
+        m_rxReadIndex    = m_rxPendingIndex;
+        m_rxPendingIndex = previous;
+        m_hasNewRxData   = false;
+    }
+    taskEXIT_CRITICAL();
+    return m_isConnected && hasNewData;
+}
 
 RemoteControl::SwitchEvent2Pos RemoteControl::judgeSwitchEvent(SwitchStatus2Pos currentStatus, SwitchStatus2Pos lastStatus)
 {
-    // SwitchEvent2Pos枚举值:
+    if (!m_isEventInitialized) return SwitchEvent2Pos::SWITCH_NO_CHANGE;
+    // SwitchStatus2Pos枚举值:
     // SWITCH_UP     = 1
     // SWITCH_DOWN   = 2
     // SWITCH_ERROR  = -1
-    if (currentStatus == SwitchStatus2Pos::SWITCH_ERROR || lastStatus == SwitchStatus2Pos::SWITCH_ERROR) {
-        return SwitchEvent2Pos::SWITCH_EVENT_STATUS_ERROR;
-    }
     // 使用枚举值差值判断跳变事件
     switch (static_cast<int8_t>(currentStatus) - static_cast<int8_t>(lastStatus)) {
         case 0:
@@ -69,13 +158,19 @@ RemoteControl::SwitchEvent2Pos RemoteControl::judgeSwitchEvent(SwitchStatus2Pos 
  */
 RemoteControl::SwitchEvent3Pos RemoteControl::judgeSwitchEvent(SwitchStatus3Pos currentStatus, SwitchStatus3Pos lastStatus)
 {
-    // SwitchEvent3Pos枚举值:
+    if (!m_isEventInitialized) return SwitchEvent3Pos::SWITCH_NO_CHANGE;
+    // SwitchStatus3Pos枚举值:
     // SWITCH_UP     = 1
     // SWITCH_DOWN   = 2
     // SWITCH_MIDDLE = 3
     // SWITCH_ERROR  = -1
     if (currentStatus == SwitchStatus3Pos::SWITCH_ERROR || lastStatus == SwitchStatus3Pos::SWITCH_ERROR) {
         return SwitchEvent3Pos::SWITCH_EVENT_STATUS_ERROR;
+    }
+    // 三档拨杆的正常跳变必须经过中档
+    if ((lastStatus == SwitchStatus3Pos::SWITCH_UP && currentStatus == SwitchStatus3Pos::SWITCH_DOWN) ||
+        (lastStatus == SwitchStatus3Pos::SWITCH_DOWN && currentStatus == SwitchStatus3Pos::SWITCH_UP)) {
+        return SwitchEvent3Pos::SWITCH_EVENT_OUT_OF_RANGE_ERROR;
     }
     // 使用枚举值差值判断跳变事件
     switch (static_cast<int8_t>(currentStatus) - static_cast<int8_t>(lastStatus)) {
@@ -100,6 +195,7 @@ RemoteControl::SwitchEvent3Pos RemoteControl::judgeSwitchEvent(SwitchStatus3Pos 
  */
 RemoteControl::KeyEvent RemoteControl::judgeKeyEvent(KeyStatus currentStatus, KeyStatus lastStatus)
 {
+    if (!m_isEventInitialized) return KeyEvent::KEY_NO_CHANGE;
     switch (static_cast<int8_t>(currentStatus) - static_cast<int8_t>(lastStatus)) {
         case 0:
             return KeyEvent::KEY_NO_CHANGE;
@@ -133,11 +229,11 @@ fp32 RemoteControl::applyStickDeadZone(fp32 stickValue)
  ******************************************************************************/
 
 /**
- * @brief 构造函数，初始化遥控器接收数据地址指针和连接状态
+ * @brief 构造函数，初始化接收缓冲区、控制值和事件状态
  */
 DR16RemoteControl::DR16RemoteControl(fp32 stickDeadZone)
     : RemoteControl(stickDeadZone),
-      m_originalRxDataPointer(nullptr),
+      m_rxFrames{},
       m_rightStickX(0.0f),
       m_rightStickY(0.0f),
       m_leftStickX(0.0f),
@@ -168,67 +264,89 @@ DR16RemoteControl::DR16RemoteControl(fp32 stickDeadZone)
 }
 
 /**
- * @brief 从中断中获取DR16遥控器接收数据地址，更新相关标志位
- * @param data DR16遥控器接收数据指针
- * @note 本函数不解码遥控器数据
+ * @brief 在UART接收回调中组帧并发布最新完整帧, 不解包控制值
+ * @param data 本段接收数据, ERROR通知时为nullptr
+ * @param length 本段接收数据的字节数, IDLE通知允许为0
+ * @param event UART接收事件
  */
-void DR16RemoteControl::receiveRxDataFromISR(const uint8_t *data)
+void DR16RemoteControl::receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event)
 {
-    m_originalRxDataPointer = (DR16OriginalRxData *)data;
-    m_uartRxTimestamp       = HAL_GetTick(); // 更新接收时间戳
-    m_isConnected           = true;          // 接收到数据则认为遥控器连接正常
-    m_isDecodeCompleted     = false;         // 标志解码未完成
+    assembleRxFramesFromISR(data, length, event, m_rxFrames, sizeof(DR16OriginalRxData), RxSyncMode::IDLE);
+}
+
+bool DR16RemoteControl::isRxFrameValid(const uint8_t *data) const
+{
+    const auto &rxData = *reinterpret_cast<const DR16OriginalRxData *>(data);
+    return rxData.Channel_0 >= 364 && rxData.Channel_0 <= 1684 &&
+           rxData.Channel_1 >= 364 && rxData.Channel_1 <= 1684 &&
+           rxData.Channel_2 >= 364 && rxData.Channel_2 <= 1684 &&
+           rxData.Channel_3 >= 364 && rxData.Channel_3 <= 1684 &&
+           rxData.Channel_4 >= 364 && rxData.Channel_4 <= 1684 &&
+           rxData.Switch_1 >= 1 && rxData.Switch_1 <= 3 &&
+           rxData.Switch_2 >= 1 && rxData.Switch_2 <= 3 &&
+           rxData.Mouse_Left_Key <= 1 && rxData.Mouse_Right_Key <= 1;
 }
 
 /**
- * @brief 接收DR16遥控器数据后解码数据, 判断遥控器连接状态
- * @note 本函数在使用get函数获取遥控器数据时自动调用
+ * @brief 在控制周期开头调用一次, 获取新帧并更新控制值和本轮事件
+ * @note 无新帧时仅检查连接状态并清除上轮事件, getter不触发解包
  */
-void DR16RemoteControl::decodeRxData()
+void DR16RemoteControl::updateRxData()
 {
-    // 判断遥控器连接状态，若使用的数据过时超过100ms则认为遥控器断开
-    if (HAL_GetTick() - m_uartRxTimestamp > 100 || m_originalRxDataPointer == nullptr) {
-        m_isConnected = false;
-        return;
-    }
-    // 解码遥控器数据, 每次接收数据仅解码一次
-    if (m_isDecodeCompleted) return;
-    m_rightStickX       = (fp32)(m_originalRxDataPointer->Channel_0 - 1024) / 660.0f;
-    m_rightStickY       = (fp32)(m_originalRxDataPointer->Channel_1 - 1024) / 660.0f;
-    m_leftStickX        = (fp32)(m_originalRxDataPointer->Channel_2 - 1024) / 660.0f;
-    m_leftStickY        = (fp32)(m_originalRxDataPointer->Channel_3 - 1024) / 660.0f;
-    m_scrollWheel       = (fp32)(m_originalRxDataPointer->Channel_4 - 1024) / 660.0f;
-    m_mouseXSpeed       = (fp32)(m_originalRxDataPointer->Mouse_X / 32768.0f);
-    m_mouseYSpeed       = (fp32)(m_originalRxDataPointer->Mouse_Y / 32768.0f);
-    m_mouseWheelSpeed   = (fp32)(m_originalRxDataPointer->Mouse_Z / 32768.0f);
-    m_isDecodeCompleted = true; // 更新解码完成标志，避免重复解码
+    clearEvent();
+    if (!acquireRxFrame()) return;
+
+    const DR16OriginalRxData &rxData = m_rxFrames[m_rxReadIndex];
+    decodeControlData(rxData);
+    updateEvent(rxData);
+}
+
+/**
+ * @brief 解包当前读取帧的摇杆、拨轮和鼠标速度, 缓存归一化控制值
+ */
+void DR16RemoteControl::decodeControlData(const DR16OriginalRxData &rxData)
+{
+    m_rightStickX     = (fp32)(rxData.Channel_0 - 1024) / 660.0f;
+    m_rightStickY     = (fp32)(rxData.Channel_1 - 1024) / 660.0f;
+    m_leftStickX      = (fp32)(rxData.Channel_2 - 1024) / 660.0f;
+    m_leftStickY      = (fp32)(rxData.Channel_3 - 1024) / 660.0f;
+    m_scrollWheel     = (fp32)(rxData.Channel_4 - 1024) / 660.0f;
+    m_mouseXSpeed     = (fp32)(rxData.Mouse_X / 32768.0f);
+    m_mouseYSpeed     = (fp32)(rxData.Mouse_Y / 32768.0f);
+    m_mouseWheelSpeed = (fp32)(rxData.Mouse_Z / 32768.0f);
+}
+
+void DR16RemoteControl::clearEvent()
+{
+    m_rightSwitchEvent = m_leftSwitchEvent = SwitchEvent3Pos::SWITCH_NO_CHANGE;
+    m_mouseLeftKeyEvent = m_mouseRightKeyEvent = KeyEvent::KEY_NO_CHANGE;
+    for (auto &event : m_keyboardKeyEvent) event = KeyEvent::KEY_NO_CHANGE;
 }
 
 /**
  * @brief 更新所有按键和拨杆的跳变事件并缓存
- * @note 使用get方法获取按键状态前请先调用本函数
- * @note 建议在每个控制循环的开头调用一次，且一个控制循环内只调用一次，以保证控制循环中获取的事件状态一致
+ * @note 仅由updateRxData在取得新的有效帧后调用
  */
-void DR16RemoteControl::updateEvent()
+void DR16RemoteControl::updateEvent(const DR16OriginalRxData &rxData)
 {
-    if (m_originalRxDataPointer == nullptr) return;
     m_lastRightSwitchStatus   = m_rightSwitchStatus;
-    m_rightSwitchStatus       = (SwitchStatus3Pos)m_originalRxDataPointer->Switch_2;
+    m_rightSwitchStatus       = (SwitchStatus3Pos)rxData.Switch_2;
     m_rightSwitchEvent        = judgeSwitchEvent(m_rightSwitchStatus, m_lastRightSwitchStatus);
     m_lastLeftSwitchStatus    = m_leftSwitchStatus;
-    m_leftSwitchStatus        = (SwitchStatus3Pos)m_originalRxDataPointer->Switch_1;
+    m_leftSwitchStatus        = (SwitchStatus3Pos)rxData.Switch_1;
     m_leftSwitchEvent         = judgeSwitchEvent(m_leftSwitchStatus, m_lastLeftSwitchStatus);
     m_lastMouseLeftKeyStatus  = m_mouseLeftKeyStatus;
-    m_mouseLeftKeyStatus      = (KeyStatus)m_originalRxDataPointer->Mouse_Left_Key;
+    m_mouseLeftKeyStatus      = (KeyStatus)rxData.Mouse_Left_Key;
     m_mouseLeftKeyEvent       = judgeKeyEvent(m_mouseLeftKeyStatus, m_lastMouseLeftKeyStatus);
     m_lastMouseRightKeyStatus = m_mouseRightKeyStatus;
-    m_mouseRightKeyStatus     = (KeyStatus)m_originalRxDataPointer->Mouse_Right_Key;
+    m_mouseRightKeyStatus     = (KeyStatus)rxData.Mouse_Right_Key;
     m_mouseRightKeyEvent      = judgeKeyEvent(m_mouseRightKeyStatus, m_lastMouseRightKeyStatus);
     for (uint8_t keyIndex = 0; keyIndex < static_cast<uint8_t>(KeyboardKeyIndex::KEY_TOTAL_NUMBER); keyIndex++) {
         m_lastKeyboardKeyStatus[keyIndex] = m_keyboardKeyStatus[keyIndex];
-        m_keyboardKeyStatus[keyIndex]     = (KeyStatus)(m_originalRxDataPointer->Keyboard_Key >> keyIndex & 0x01);
+        m_keyboardKeyStatus[keyIndex]     = (KeyStatus)(rxData.Keyboard_Key >> keyIndex & 0x01);
         m_keyboardKeyEvent[keyIndex]      = judgeKeyEvent(m_keyboardKeyStatus[keyIndex], m_lastKeyboardKeyStatus[keyIndex]);
     }
+    m_isEventInitialized = true;
 }
 
 /******************************************************************************
@@ -242,7 +360,7 @@ void DR16RemoteControl::updateEvent()
  */
 ET08ARemoteControl::ET08ARemoteControl(Config config, fp32 stickDeadZone)
     : RemoteControl(stickDeadZone),
-      m_originalRxDataPointer(nullptr),
+      m_rxFrames{},
       m_protocolData{},
       m_config(config),
       m_switchSA(SwitchStatus2Pos::SWITCH_ERROR),
@@ -280,36 +398,54 @@ ET08ARemoteControl::ET08ARemoteControl(fp32 stickDeadZone)
     : ET08ARemoteControl(Config{}, stickDeadZone) {}
 
 /**
- * @brief 从中断中获取ET08A遥控器接收数据地址，更新相关标志位
- * @param data ET08A遥控器接收数据指针
- * @note 本函数不解码遥控器数据
+ * @brief 在UART接收回调中组帧并发布最新完整帧, 不解包控制值
+ * @param data 本段接收数据, ERROR通知时为nullptr
+ * @param length 本段接收数据的字节数, IDLE通知允许为0
+ * @param event UART接收事件
  */
-void ET08ARemoteControl::receiveRxDataFromISR(const uint8_t *data)
+void ET08ARemoteControl::receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event)
 {
-    m_originalRxDataPointer = (ET08ARawPacket *)data;
-    m_uartRxTimestamp       = HAL_GetTick();
-    m_isDecodeCompleted     = false;
+    assembleRxFramesFromISR(data, length, event, m_rxFrames, sizeof(ET08ARawPacket), RxSyncMode::FRAME_HEADER);
+}
+
+bool ET08ARemoteControl::isRxFrameValid(const uint8_t *data) const
+{
+    return data[0] == 0x0F && data[sizeof(ET08ARawPacket) - 1] == 0x00;
 }
 
 /**
- * @brief 接收ET08A遥控器数据后解码数据, 判断遥控器连接状态
- * @note 本函数在使用get函数获取遥控器数据时自动调用
+ * @brief 在控制周期开头调用一次, 获取新帧并更新控制值和本轮事件
+ * @note 丢帧/失控保护标志使数据不可用, 控制值保持上次缓存
  */
-void ET08ARemoteControl::decodeRxData()
+void ET08ARemoteControl::updateRxData()
 {
-    // 判断遥控器连接状态，若使用的数据过时超过100ms则认为遥控器断开
-    if (HAL_GetTick() - m_uartRxTimestamp > 100 || m_originalRxDataPointer->startByte != 0x0F || m_originalRxDataPointer == nullptr) {
-        m_isConnected = false;
-        return;
+    clearEvent();
+    const bool hasNewData = acquireRxFrame();
+    const ET08ARawPacket &rxData = m_rxFrames[m_rxReadIndex];
+    updateConnectionStatus(rxData);
+    if (!m_isConnected || !hasNewData) return;
+
+    decodeControlData(rxData);
+    updateEvent();
+}
+
+/**
+ * @brief 根据帧中的丢帧和失控保护标志更新连接状态及事件基准
+ */
+void ET08ARemoteControl::updateConnectionStatus(const ET08ARawPacket &rxData)
+{
+    if ((rxData.flags & 0x0C) != 0) {
+        m_isConnected        = false;
+        m_isEventInitialized = false;
     }
+}
 
-    // 遥控器掉线时stopByte为0x0F
-    m_isConnected = !(m_originalRxDataPointer->stopByte == 0x0F);
-
-    // 解码遥控器数据, 每次接收数据仅解码一次
-    if (m_isDecodeCompleted) return;
-
-    parseET08AProtocol(m_originalRxDataPointer->data, m_protocolData);
+/**
+ * @brief 解包当前读取帧的通道数据, 缓存归一化摇杆、旋钮和微调值
+ */
+void ET08ARemoteControl::decodeControlData(const ET08ARawPacket &rxData)
+{
+    parseET08AProtocol(rxData, m_protocolData);
 
     // ET08A遥控器通道值范围是[353, 1694], 中点1024
     // 为保证数值在[-1.0, 1.0]范围内且保证线性性, 取较大的下限偏移量671, 最终归一化数值范围是[-1.0, 0.9985]
@@ -323,20 +459,20 @@ void ET08ARemoteControl::decodeRxData()
     m_trimmerT2   = (m_protocolData.trimmerT2 - 1024) / 671.0f;
     m_trimmerT3   = (m_protocolData.trimmerT3 - 1024) / 671.0f;
     m_trimmerT4   = (m_protocolData.trimmerT4 - 1024) / 671.0f;
+}
 
-    m_isDecodeCompleted = true;
+void ET08ARemoteControl::clearEvent()
+{
+    m_eventSA = m_eventSD = SwitchEvent2Pos::SWITCH_NO_CHANGE;
+    m_eventSB = m_eventSC = SwitchEvent3Pos::SWITCH_NO_CHANGE;
 }
 
 /**
  * @brief 更新所有按键和拨杆的跳变事件并缓存
- * @note 使用get方法获取按键状态前请先调用本函数
- * @note 建议在每个控制循环的开头调用一次，且一个控制循环内只调用一次，以保证控制循环中获取的事件状态一致
+ * @note 仅由updateRxData在取得新的有效帧后调用
  */
 void ET08ARemoteControl::updateEvent()
 {
-    if (m_originalRxDataPointer == nullptr) return;
-    decodeRxData();
-
     m_lastSwitchSA = m_switchSA;
     m_lastSwitchSB = m_switchSB;
     if (m_config.switchSASB != ET08AChannelIndex::CH_NONE) { // SA和SB复用通道, SB微调
@@ -353,6 +489,7 @@ void ET08ARemoteControl::updateEvent()
                     m_switchSB = SwitchStatus3Pos::SWITCH_DOWN;
                     break;
                 default:
+                    m_switchSB = SwitchStatus3Pos::SWITCH_ERROR;
                     break;
             }
         } else {
@@ -368,6 +505,7 @@ void ET08ARemoteControl::updateEvent()
                     m_switchSB = SwitchStatus3Pos::SWITCH_DOWN;
                     break;
                 default:
+                    m_switchSB = SwitchStatus3Pos::SWITCH_ERROR;
                     break;
             }
         }
@@ -404,6 +542,7 @@ void ET08ARemoteControl::updateEvent()
                     m_switchSC = SwitchStatus3Pos::SWITCH_DOWN;
                     break;
                 default:
+                    m_switchSC = SwitchStatus3Pos::SWITCH_ERROR;
                     break;
             }
         } else {
@@ -419,6 +558,7 @@ void ET08ARemoteControl::updateEvent()
                     m_switchSC = SwitchStatus3Pos::SWITCH_DOWN;
                     break;
                 default:
+                    m_switchSC = SwitchStatus3Pos::SWITCH_ERROR;
                     break;
             }
         }
@@ -438,16 +578,17 @@ void ET08ARemoteControl::updateEvent()
     }
     m_eventSC = judgeSwitchEvent(m_switchSC, m_lastSwitchSC);
     m_eventSD = judgeSwitchEvent(m_switchSD, m_lastSwitchSD);
+    m_isEventInitialized = true;
 }
 
-/*
-    @brief 解析ET08A遥控器协议数据
-    @param buffer 原始协议数据缓冲区指针
-*/
-void ET08ARemoteControl::parseET08AProtocol(const uint8_t *buffer, ET08AProtocolData &out) const
+/**
+ * @brief 解包已校验的ET08A完整帧
+ * @param packet 任务侧接收快照
+ * @param out 按配置映射后的通道数据
+ */
+void ET08ARemoteControl::parseET08AProtocol(const ET08ARawPacket &packet, ET08AProtocolData &out) const
 {
-    if (buffer == nullptr) return;
-
+    const uint8_t *buffer = packet.data;
     uint16_t temp_ch[16];
 
     temp_ch[0]  = ((buffer[0] | buffer[1] << 8) & 0x07FF);
@@ -503,7 +644,7 @@ void ET08ARemoteControl::parseET08AProtocol(const uint8_t *buffer, ET08AProtocol
  */
 VT13RemoteControl::VT13RemoteControl(fp32 stickDeadZone)
     : RemoteControl(stickDeadZone),
-      m_originalRxDataPointer(nullptr),
+      m_rxFrames{},
       m_rightStickX(0.0f),
       m_rightStickY(0.0f),
       m_leftStickX(0.0f),
@@ -545,92 +686,101 @@ VT13RemoteControl::VT13RemoteControl(fp32 stickDeadZone)
 }
 
 /**
- * @brief 从中断中获取VT13图传遥控器接收数据地址，更新相关标志位
- * @param data VT13图传遥控器接收数据指针
- * @note 内部校验帧头(0xA9 0x53)，不匹配时直接返回不做处理
- * @note 本函数不解码遥控器数据
+ * @brief 在UART接收回调中组帧并发布最新完整帧, 不解包控制值
+ * @param data 本段接收数据, ERROR通知时为nullptr
+ * @param length 本段接收数据的字节数, IDLE通知允许为0
+ * @param event UART接收事件
  */
-void VT13RemoteControl::receiveRxDataFromISR(const uint8_t *data)
+void VT13RemoteControl::receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event)
 {
-    if (data[0] != SOF_1 || data[1] != SOF_2) return;
-    m_originalRxDataPointer = (VT13OriginalRxData *)data;
-    m_uartRxTimestamp       = HAL_GetTick();
-    m_isConnected           = true;
-    m_isDecodeCompleted     = false;
+    assembleRxFramesFromISR(data, length, event, m_rxFrames, sizeof(VT13OriginalRxData), RxSyncMode::FRAME_HEADER);
+}
+
+bool VT13RemoteControl::isRxFrameValid(const uint8_t *data) const
+{
+    return data[0] == SOF_1 && data[1] == SOF_2 && CRCCalculator::verifyCRC16(data, FRAME_SIZE);
 }
 
 /**
- * @brief 接收VT13图传遥控器数据后解码数据, 判断连接状态
- * @note 本函数在使用get函数获取遥控器数据时自动调用
+ * @brief 在控制周期开头调用一次, 获取新帧并更新控制值和本轮事件
+ * @note 无新帧时仅检查连接状态并清除上轮事件, getter不触发解包
  */
-void VT13RemoteControl::decodeRxData()
+void VT13RemoteControl::updateRxData()
 {
-    // 判断连接状态，若数据过时超过100ms则认为断开
-    if (HAL_GetTick() - m_uartRxTimestamp > 100 || m_originalRxDataPointer == nullptr) {
-        m_isConnected = false;
-        return;
-    }
-    // 每次接收数据仅解码一次
-    if (m_isDecodeCompleted) return;
-    // CRC16校验
-    if (!CRCCalculator::verifyCRC16((const uint8_t *)m_originalRxDataPointer, FRAME_SIZE)) {
-        return;
-    }
-    m_rightStickX       = (fp32)(m_originalRxDataPointer->Channel_0 - 1024) / 660.0f;
-    m_rightStickY       = (fp32)(m_originalRxDataPointer->Channel_1 - 1024) / 660.0f;
-    m_leftStickY        = (fp32)(m_originalRxDataPointer->Channel_2 - 1024) / 660.0f;
-    m_leftStickX        = (fp32)(m_originalRxDataPointer->Channel_3 - 1024) / 660.0f;
-    m_scrollWheel       = (fp32)(m_originalRxDataPointer->Wheel - 1024) / 660.0f;
-    m_mouseXSpeed       = (fp32)(m_originalRxDataPointer->Mouse_X / 32768.0f);
-    m_mouseYSpeed       = (fp32)(m_originalRxDataPointer->Mouse_Y / 32768.0f);
-    m_mouseWheelSpeed   = (fp32)(m_originalRxDataPointer->Mouse_Z / 32768.0f);
-    m_isDecodeCompleted = true;
+    clearEvent();
+    if (!acquireRxFrame()) return;
+
+    const VT13OriginalRxData &rxData = m_rxFrames[m_rxReadIndex];
+    decodeControlData(rxData);
+    updateEvent(rxData);
+}
+
+/**
+ * @brief 解包当前读取帧的摇杆、拨轮和鼠标速度, 缓存归一化控制值
+ */
+void VT13RemoteControl::decodeControlData(const VT13OriginalRxData &rxData)
+{
+    m_rightStickX     = (fp32)(rxData.Channel_0 - 1024) / 660.0f;
+    m_rightStickY     = (fp32)(rxData.Channel_1 - 1024) / 660.0f;
+    m_leftStickY      = (fp32)(rxData.Channel_2 - 1024) / 660.0f;
+    m_leftStickX      = (fp32)(rxData.Channel_3 - 1024) / 660.0f;
+    m_scrollWheel     = (fp32)(rxData.Wheel - 1024) / 660.0f;
+    m_mouseXSpeed     = (fp32)(rxData.Mouse_X / 32768.0f);
+    m_mouseYSpeed     = (fp32)(rxData.Mouse_Y / 32768.0f);
+    m_mouseWheelSpeed = (fp32)(rxData.Mouse_Z / 32768.0f);
+}
+
+void VT13RemoteControl::clearEvent()
+{
+    m_modeSwitchEvent = SwitchEvent3Pos::SWITCH_NO_CHANGE;
+    m_pauseKeyEvent = m_fn1KeyEvent = m_fn2KeyEvent = m_triggerKeyEvent = KeyEvent::KEY_NO_CHANGE;
+    m_mouseLeftKeyEvent = m_mouseRightKeyEvent = m_mouseMiddleKeyEvent = KeyEvent::KEY_NO_CHANGE;
+    for (auto &event : m_keyboardKeyEvent) event = KeyEvent::KEY_NO_CHANGE;
 }
 
 /**
  * @brief 更新所有按键和拨杆的跳变事件并缓存
- * @note 使用get方法获取按键状态前请先调用本函数
- * @note 建议在每个控制循环的开头调用一次，且一个控制循环内只调用一次，以保证控制循环中获取的事件状态一致
+ * @note 仅由updateRxData在取得新的有效帧后调用
  */
-void VT13RemoteControl::updateEvent()
+void VT13RemoteControl::updateEvent(const VT13OriginalRxData &rxData)
 {
-    if (m_originalRxDataPointer == nullptr) return;
     // 档位开关
     m_lastModeSwitchStatus = m_modeSwitchStatus;
-    m_modeSwitchStatus     = mapModeSwitch(m_originalRxDataPointer->Mode_Switch);
+    m_modeSwitchStatus     = mapModeSwitch(rxData.Mode_Switch);
     m_modeSwitchEvent      = judgeSwitchEvent(m_modeSwitchStatus, m_lastModeSwitchStatus);
     // 暂停键
     m_lastPauseKeyStatus = m_pauseKeyStatus;
-    m_pauseKeyStatus     = (KeyStatus)m_originalRxDataPointer->Pause;
+    m_pauseKeyStatus     = (KeyStatus)rxData.Pause;
     m_pauseKeyEvent      = judgeKeyEvent(m_pauseKeyStatus, m_lastPauseKeyStatus);
     // 自定义按键(左)
     m_lastFn1KeyStatus = m_fn1KeyStatus;
-    m_fn1KeyStatus     = (KeyStatus)m_originalRxDataPointer->Fn_1;
+    m_fn1KeyStatus     = (KeyStatus)rxData.Fn_1;
     m_fn1KeyEvent      = judgeKeyEvent(m_fn1KeyStatus, m_lastFn1KeyStatus);
     // 自定义按键(右)
     m_lastFn2KeyStatus = m_fn2KeyStatus;
-    m_fn2KeyStatus     = (KeyStatus)m_originalRxDataPointer->Fn_2;
+    m_fn2KeyStatus     = (KeyStatus)rxData.Fn_2;
     m_fn2KeyEvent      = judgeKeyEvent(m_fn2KeyStatus, m_lastFn2KeyStatus);
     // 瞄准键
     m_lastTriggerKeyStatus = m_triggerKeyStatus;
-    m_triggerKeyStatus     = (KeyStatus)m_originalRxDataPointer->Trigger;
+    m_triggerKeyStatus     = (KeyStatus)rxData.Trigger;
     m_triggerKeyEvent      = judgeKeyEvent(m_triggerKeyStatus, m_lastTriggerKeyStatus);
     // 鼠标按键
     m_lastMouseLeftKeyStatus   = m_mouseLeftKeyStatus;
-    m_mouseLeftKeyStatus       = (KeyStatus)m_originalRxDataPointer->Mouse_Left;
+    m_mouseLeftKeyStatus       = (KeyStatus)rxData.Mouse_Left;
     m_mouseLeftKeyEvent        = judgeKeyEvent(m_mouseLeftKeyStatus, m_lastMouseLeftKeyStatus);
     m_lastMouseRightKeyStatus  = m_mouseRightKeyStatus;
-    m_mouseRightKeyStatus      = (KeyStatus)m_originalRxDataPointer->Mouse_Right;
+    m_mouseRightKeyStatus      = (KeyStatus)rxData.Mouse_Right;
     m_mouseRightKeyEvent       = judgeKeyEvent(m_mouseRightKeyStatus, m_lastMouseRightKeyStatus);
     m_lastMouseMiddleKeyStatus = m_mouseMiddleKeyStatus;
-    m_mouseMiddleKeyStatus     = (KeyStatus)m_originalRxDataPointer->Mouse_Middle;
+    m_mouseMiddleKeyStatus     = (KeyStatus)rxData.Mouse_Middle;
     m_mouseMiddleKeyEvent      = judgeKeyEvent(m_mouseMiddleKeyStatus, m_lastMouseMiddleKeyStatus);
     // 键盘按键
     for (uint8_t keyIndex = 0; keyIndex < static_cast<uint8_t>(KeyboardKeyIndex::KEY_TOTAL_NUMBER); keyIndex++) {
         m_lastKeyboardKeyStatus[keyIndex] = m_keyboardKeyStatus[keyIndex];
-        m_keyboardKeyStatus[keyIndex]     = (KeyStatus)(m_originalRxDataPointer->Keyboard_Key >> keyIndex & 0x01);
+        m_keyboardKeyStatus[keyIndex]     = (KeyStatus)(rxData.Keyboard_Key >> keyIndex & 0x01);
         m_keyboardKeyEvent[keyIndex]      = judgeKeyEvent(m_keyboardKeyStatus[keyIndex], m_lastKeyboardKeyStatus[keyIndex]);
     }
+    m_isEventInitialized = true;
 }
 
 /**

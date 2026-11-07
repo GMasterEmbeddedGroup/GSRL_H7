@@ -16,6 +16,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "gsrl_common.h"
+#include "drv_uart.h"
 #include <cstdint>
 #include <math.h>
 
@@ -24,6 +25,10 @@
 /**
  * @brief 遥控器基类
  * @note 该类不可实例化
+ * @note 同一实例由一路不嵌套的UART/DMA接收回调写入, 由一个RTOS任务每轮调用一次updateRxData
+ * @note UART/DMA抢占优先级须相同且数值不小于configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY
+ * @note F4库使用decodeRxData解包并单独调用updateEvent, 数值getter/isConnected会触发解包
+ * @note 本库由updateRxData统一更新控制值和事件, 不单独调用updateEvent; getter/isConnected只读本轮缓存
  */
 class RemoteControl
 {
@@ -32,7 +37,7 @@ public:
     enum class SwitchStatus2Pos : int8_t {
         SWITCH_UP = 1,
         SWITCH_DOWN,
-        SWITCH_ERROR = -1 // 检查m_originalRxDataPointer是否为空
+        SWITCH_ERROR = -1 // 尚无有效拨杆状态
     };
 
     // 遥控器双档拨杆跳变事件
@@ -40,7 +45,7 @@ public:
         SWITCH_NO_CHANGE,
         SWITCH_TOGGLE_UP_DOWN,
         SWITCH_TOGGLE_DOWN_UP,
-        SWITCH_EVENT_NO_UPDATE_ERROR    = -1, // 检查RemoteControl::updateEvent()函数是否提前调用
+        SWITCH_EVENT_NO_UPDATE_ERROR    = -1, // 检查updateRxData()是否已调用
         SWITCH_EVENT_STATUS_ERROR       = -2, // 检查当前或上一次拨杆状态是否为SWITCH_ERROR
         SWITCH_EVENT_OUT_OF_RANGE_ERROR = -3  // 检查当前或上一次拨杆状态是否超出枚举值范围(遥控数据解包错误)
     };
@@ -50,7 +55,7 @@ public:
         SWITCH_UP = 1,
         SWITCH_DOWN,
         SWITCH_MIDDLE,
-        SWITCH_ERROR = -1 // 检查m_originalRxDataPointer是否为空
+        SWITCH_ERROR = -1 // 尚无有效拨杆状态
     };
 
     // 遥控器三档拨杆跳变事件
@@ -60,16 +65,16 @@ public:
         SWITCH_TOGGLE_MIDDLE_UP,
         SWITCH_TOGGLE_DOWN_MIDDLE,
         SWITCH_TOGGLE_MIDDLE_DOWN,
-        SWITCH_EVENT_NO_UPDATE_ERROR    = -1, // 检查RemoteControl::updateEvent()函数是否提前调用
+        SWITCH_EVENT_NO_UPDATE_ERROR    = -1, // 检查updateRxData()是否已调用
         SWITCH_EVENT_STATUS_ERROR       = -2, // 检查当前或上一次拨杆状态是否为SWITCH_ERROR
-        SWITCH_EVENT_OUT_OF_RANGE_ERROR = -3  // 检查当前或上一次拨杆状态是否超出枚举值范围(遥控数据解包错误)
+        SWITCH_EVENT_OUT_OF_RANGE_ERROR = -3  // 档位越界或上、下档之间未观察到中档的直接跳变
     };
 
     // 遥控器按键状态
     enum class KeyStatus : int8_t {
         KEY_RELEASE = 0,
         KEY_PRESS,
-        KEY_ERROR = -1 // 检查m_originalRxDataPointer是否为空
+        KEY_ERROR = -1 // 尚无有效按键状态
     };
 
     // 遥控器按键跳变事件
@@ -77,29 +82,54 @@ public:
         KEY_NO_CHANGE,
         KEY_TOGGLE_PRESS_RELEASE,
         KEY_TOGGLE_RELEASE_PRESS,
-        KEY_EVENT_NO_UPDATE_ERROR = -1 // 检查DR16RemoteControl::updateEvent()函数是否提前调用
+        KEY_EVENT_NO_UPDATE_ERROR = -1 // 检查updateRxData()是否已调用
     };
 
 protected:
+    enum class RxSyncMode : uint8_t {
+        FRAME_HEADER,
+        IDLE
+    };
+
     // 遥控器连接状态检测
-    uint32_t m_uartRxTimestamp; // 使用毫秒级HAL_GetTick()获取, 判断遥控器连接状态
+    volatile uint32_t m_uartRxTimestamp; // 完整帧接收时间, 使用HAL_GetTick()
     bool m_isConnected;
-    bool m_isDecodeCompleted; // 解码完成标志
-    fp32 m_stickDeadZone;     // 遥控器摇杆死区
+    bool m_isEventInitialized; // 本轮任务是否已有可比较的有效状态
+    fp32 m_stickDeadZone; // 遥控器摇杆死区
+
+    // 三缓冲: m_rxFrames[3]分别用于写入、待取、读取, 接收和解包各用各的内存
+    // 中断收完并校验一帧后, 交换写入区和待取区; 待取区只保留最新完整帧
+    // 任务有新帧时交换待取区和读取区, 再解包; 无新帧时跳过解包
+    // 交换的只是编号, 不复制整帧; 任务交换时用短临界区防止中断打断
+    uint8_t m_rxWriteIndex; // 拼装正在接收的一帧
+    volatile uint8_t m_rxPendingIndex; // 留住最新完整帧, 等待任务取走
+    uint8_t m_rxReadIndex; // 任务解包使用, 中断不会覆写
+    volatile bool m_hasRxData;
+    volatile bool m_hasNewRxData;
+    volatile bool m_rxInterrupted; // 两轮任务之间发生接收间断, 下轮重新建立事件基准
+    uint16_t m_rxLength; // 写入槽中已组装的字节数
+    bool m_isRxSynced;   // DR16通过IDLE建立帧边界
 
 public:
-    virtual ~RemoteControl()                               = default;
-    virtual void receiveRxDataFromISR(const uint8_t *data) = 0;
-    virtual void decodeRxData()                            = 0;
-    virtual void updateEvent()                             = 0;
-    bool isConnected()
+    virtual ~RemoteControl() = default;
+
+    // F4库接收入口只传data; 本接口须传入data、length和event
+    // length为本段接收数据的字节数; 必须转发IDLE(包括零字节)和ERROR通知
+    virtual void receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event) = 0;
+    virtual void updateRxData() = 0;
+    bool isConnected() const
     {
-        decodeRxData();
         return m_isConnected;
     }
 
 protected:
     RemoteControl(fp32 stickDeadZone = 0.0f);
+    void assembleRxFramesFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event,
+                                 void *rxFrames, uint16_t frameSize, RxSyncMode syncMode);
+    virtual bool isRxFrameValid(const uint8_t *data) const = 0;
+    void resetRxStateFromISR();
+    void publishRxFrameFromISR();
+    bool acquireRxFrame();
     SwitchEvent2Pos judgeSwitchEvent(SwitchStatus2Pos currentStatus, SwitchStatus2Pos lastStatus);
     SwitchEvent3Pos judgeSwitchEvent(SwitchStatus3Pos currentStatus, SwitchStatus3Pos lastStatus);
     KeyEvent judgeKeyEvent(KeyStatus currentStatus, KeyStatus lastStatus);
@@ -109,6 +139,7 @@ protected:
 /**
  * @brief 大疆DR16遥控器类，用于解码DR16遥控器接收数据
  * @note 使用前需确保receiveRxDataFromISR方法在对应UART接收中断服务函数中被调用
+ * @note 与F4库不同: 启动或失步后先等待IDLE, 从下一帧开始接收; 检查18字节帧的通道和拨杆范围
  */
 class DR16RemoteControl : public RemoteControl
 {
@@ -152,7 +183,7 @@ public:
     };
 
 private:
-    DR16OriginalRxData *m_originalRxDataPointer; // DR16遥控器原始接收数据指针
+    DR16OriginalRxData m_rxFrames[3];
     // DR16遥控器解码数据
     fp32 m_rightStickX;
     fp32 m_rightStickY;
@@ -178,42 +209,40 @@ private:
     KeyStatus m_lastKeyboardKeyStatus[static_cast<uint8_t>(KeyboardKeyIndex::KEY_TOTAL_NUMBER)]; // 上一次键盘按键状态
     KeyEvent m_keyboardKeyEvent[static_cast<uint8_t>(KeyboardKeyIndex::KEY_TOTAL_NUMBER)];
 
+    bool isRxFrameValid(const uint8_t *data) const override;
+    void decodeControlData(const DR16OriginalRxData &rxData);
+    void updateEvent(const DR16OriginalRxData &rxData);
+    void clearEvent();
+
 public:
     DR16RemoteControl(fp32 stickDeadZone = 0.0f);
 
-    void receiveRxDataFromISR(const uint8_t *data) override;
-    void decodeRxData() override;
-    void updateEvent() override;
+    void receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event) override;
+    void updateRxData() override;
 
     fp32 getRightStickX()
     {
-        decodeRxData();
         return applyStickDeadZone(m_rightStickX);
     }
     fp32 getRightStickY()
     {
-        decodeRxData();
         return applyStickDeadZone(m_rightStickY);
     }
     fp32 getLeftStickX()
     {
-        decodeRxData();
         return applyStickDeadZone(m_leftStickX);
     }
     fp32 getLeftStickY()
     {
-        decodeRxData();
         return applyStickDeadZone(m_leftStickY);
     }
     fp32 getScrollWheel()
     {
-        decodeRxData();
         return m_scrollWheel;
     }
     SwitchStatus3Pos getRightSwitchStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return SwitchStatus3Pos::SWITCH_ERROR;
-        return m_rightSwitchStatus = (SwitchStatus3Pos)m_originalRxDataPointer->Switch_2;
+        return m_rightSwitchStatus;
     }
     SwitchEvent3Pos getRightSwitchEvent()
     {
@@ -221,8 +250,7 @@ public:
     }
     SwitchStatus3Pos getLeftSwitchStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return SwitchStatus3Pos::SWITCH_ERROR;
-        return m_leftSwitchStatus = (SwitchStatus3Pos)m_originalRxDataPointer->Switch_1;
+        return m_leftSwitchStatus;
     }
     SwitchEvent3Pos getLeftSwitchEvent()
     {
@@ -230,23 +258,19 @@ public:
     }
     fp32 getMouseX()
     {
-        decodeRxData();
         return m_mouseXSpeed;
     }
     fp32 getMouseY()
     {
-        decodeRxData();
         return m_mouseYSpeed;
     }
     fp32 getMouseWheel()
     {
-        decodeRxData();
         return m_mouseWheelSpeed;
     }
     KeyStatus getMouseLeftKeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_mouseLeftKeyStatus = (KeyStatus)m_originalRxDataPointer->Mouse_Left_Key;
+        return m_mouseLeftKeyStatus;
     }
     KeyEvent getMouseLeftKeyEvent()
     {
@@ -254,8 +278,7 @@ public:
     }
     KeyStatus getMouseRightKeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_mouseRightKeyStatus = (KeyStatus)m_originalRxDataPointer->Mouse_Right_Key;
+        return m_mouseRightKeyStatus;
     }
     KeyEvent getMouseRightKeyEvent()
     {
@@ -263,8 +286,7 @@ public:
     }
     KeyStatus getKeyboardKeyStatus(KeyboardKeyIndex keyIndex)
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_keyboardKeyStatus[static_cast<uint8_t>(keyIndex)] = (KeyStatus)(m_originalRxDataPointer->Keyboard_Key >> static_cast<uint8_t>(keyIndex) & 0x01);
+        return m_keyboardKeyStatus[static_cast<uint8_t>(keyIndex)];
     }
     KeyEvent getKeyboardKeyEvent(KeyboardKeyIndex keyIndex)
     {
@@ -275,14 +297,17 @@ public:
 /**
  * @brief 天地飞ET08A遥控器类 (W.BUS)
  * @note 详细使用文档见Documentation/Device/ET08ARemoteControl.md
+ * @note 每个控制周期开头调用一次updateRxData, getter仅返回本轮缓存
+ * @note 接收UART/DMA的中断优先级数值须不小于configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY
  */
 class ET08ARemoteControl : public RemoteControl
 {
 public:
-    // ET08A遥控器原始数据结构体
+    // W.BUS完整帧为25字节(含flags); F4库的同名结构体为24字节
     struct ET08ARawPacket {
         uint8_t startByte;
         uint8_t data[22];
+        uint8_t flags; // bit0/1: CH17/18, bit2: 丢帧, bit3: 失控保护
         uint8_t stopByte;
     } __attribute__((packed));
 
@@ -339,7 +364,7 @@ private:
         uint16_t trimmerT4;
     };
 
-    ET08ARawPacket *m_originalRxDataPointer;
+    ET08ARawPacket m_rxFrames[3];
     ET08AProtocolData m_protocolData; // 解码后的协议数据缓存
     Config m_config;                  // 通道配置结构体
 
@@ -361,19 +386,24 @@ private:
     SwitchStatus3Pos m_leftSwitchStatus;
     SwitchEvent3Pos m_leftSwitchEvent;
 
+    bool isRxFrameValid(const uint8_t *data) const override;
+    void updateConnectionStatus(const ET08ARawPacket &rxData);
+    void decodeControlData(const ET08ARawPacket &rxData);
+    void updateEvent();
+    void clearEvent();
+    void parseET08AProtocol(const ET08ARawPacket &packet, ET08AProtocolData &out) const;
+
 public:
     ET08ARemoteControl(Config config, fp32 stickDeadZone = 0.0f);
     ET08ARemoteControl(fp32 stickDeadZone = 0.0f);
 
-    void receiveRxDataFromISR(const uint8_t *data) override;
-    void decodeRxData() override;
-    void updateEvent() override;
-    void parseET08AProtocol(const uint8_t *buffer, ET08AProtocolData &out) const;
+    void receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event) override;
+    void updateRxData() override;
 
     void setConfig(const Config &config)
     {
-        m_config            = config;
-        m_isDecodeCompleted = false;
+        m_config             = config; // 下一有效帧使用新映射; F4库可重新解包当前帧应用映射
+        m_isEventInitialized = false;
     }
     const Config &getConfig() const
     {
@@ -413,53 +443,43 @@ public:
     }
     fp32 getKnobLD()
     {
-        decodeRxData();
         return m_knobLD;
     }
     fp32 getKnobRD()
     {
-        decodeRxData();
         return m_knobRD;
     }
     fp32 getTrimmerT1()
     {
-        decodeRxData();
         return m_trimmerT1;
     }
     fp32 getTrimmerT2()
     {
-        decodeRxData();
         return m_trimmerT2;
     }
     fp32 getTrimmerT3()
     {
-        decodeRxData();
         return m_trimmerT3;
     }
     fp32 getTrimmerT4()
     {
-        decodeRxData();
         return m_trimmerT4;
     }
     // 标准获取函数
     fp32 getRightStickX()
     {
-        decodeRxData();
         return applyStickDeadZone(m_rightStickX);
     }
     fp32 getRightStickY()
     {
-        decodeRxData();
         return applyStickDeadZone(m_rightStickY);
     }
     fp32 getLeftStickX()
     {
-        decodeRxData();
         return applyStickDeadZone(m_leftStickX);
     }
     fp32 getLeftStickY()
     {
-        decodeRxData();
         return applyStickDeadZone(m_leftStickY);
     }
 };
@@ -523,7 +543,7 @@ public:
     };
 
 private:
-    VT13OriginalRxData *m_originalRxDataPointer; // VT13原始接收数据指针
+    VT13OriginalRxData m_rxFrames[3];
     // 摇杆和拨轮解码数据
     fp32 m_rightStickX;
     fp32 m_rightStickY;
@@ -568,39 +588,32 @@ private:
 public:
     VT13RemoteControl(fp32 stickDeadZone = 0.0f);
 
-    void receiveRxDataFromISR(const uint8_t *data) override;
-    void decodeRxData() override;
-    void updateEvent() override;
+    void receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event) override;
+    void updateRxData() override;
 
     fp32 getRightStickX()
     {
-        decodeRxData();
         return applyStickDeadZone(m_rightStickX);
     }
     fp32 getRightStickY()
     {
-        decodeRxData();
         return applyStickDeadZone(m_rightStickY);
     }
     fp32 getLeftStickX()
     {
-        decodeRxData();
         return applyStickDeadZone(m_leftStickX);
     }
     fp32 getLeftStickY()
     {
-        decodeRxData();
         return applyStickDeadZone(m_leftStickY);
     }
     fp32 getScrollWheel()
     {
-        decodeRxData();
         return m_scrollWheel;
     }
     SwitchStatus3Pos getModeSwitchStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return SwitchStatus3Pos::SWITCH_ERROR;
-        return m_modeSwitchStatus = mapModeSwitch(m_originalRxDataPointer->Mode_Switch);
+        return m_modeSwitchStatus;
     }
     SwitchEvent3Pos getModeSwitchEvent()
     {
@@ -608,8 +621,7 @@ public:
     }
     KeyStatus getPauseKeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_pauseKeyStatus = (KeyStatus)m_originalRxDataPointer->Pause;
+        return m_pauseKeyStatus;
     }
     KeyEvent getPauseKeyEvent()
     {
@@ -617,8 +629,7 @@ public:
     }
     KeyStatus getFn1KeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_fn1KeyStatus = (KeyStatus)m_originalRxDataPointer->Fn_1;
+        return m_fn1KeyStatus;
     }
     KeyEvent getFn1KeyEvent()
     {
@@ -626,8 +637,7 @@ public:
     }
     KeyStatus getFn2KeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_fn2KeyStatus = (KeyStatus)m_originalRxDataPointer->Fn_2;
+        return m_fn2KeyStatus;
     }
     KeyEvent getFn2KeyEvent()
     {
@@ -635,8 +645,7 @@ public:
     }
     KeyStatus getTriggerKeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_triggerKeyStatus = (KeyStatus)m_originalRxDataPointer->Trigger;
+        return m_triggerKeyStatus;
     }
     KeyEvent getTriggerKeyEvent()
     {
@@ -644,23 +653,19 @@ public:
     }
     fp32 getMouseX()
     {
-        decodeRxData();
         return m_mouseXSpeed;
     }
     fp32 getMouseY()
     {
-        decodeRxData();
         return m_mouseYSpeed;
     }
     fp32 getMouseWheel()
     {
-        decodeRxData();
         return m_mouseWheelSpeed;
     }
     KeyStatus getMouseLeftKeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_mouseLeftKeyStatus = (KeyStatus)m_originalRxDataPointer->Mouse_Left;
+        return m_mouseLeftKeyStatus;
     }
     KeyEvent getMouseLeftKeyEvent()
     {
@@ -668,8 +673,7 @@ public:
     }
     KeyStatus getMouseRightKeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_mouseRightKeyStatus = (KeyStatus)m_originalRxDataPointer->Mouse_Right;
+        return m_mouseRightKeyStatus;
     }
     KeyEvent getMouseRightKeyEvent()
     {
@@ -677,8 +681,7 @@ public:
     }
     KeyStatus getMouseMiddleKeyStatus()
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_mouseMiddleKeyStatus = (KeyStatus)m_originalRxDataPointer->Mouse_Middle;
+        return m_mouseMiddleKeyStatus;
     }
     KeyEvent getMouseMiddleKeyEvent()
     {
@@ -686,8 +689,7 @@ public:
     }
     KeyStatus getKeyboardKeyStatus(KeyboardKeyIndex keyIndex)
     {
-        if (m_originalRxDataPointer == nullptr) return KeyStatus::KEY_ERROR;
-        return m_keyboardKeyStatus[static_cast<uint8_t>(keyIndex)] = (KeyStatus)(m_originalRxDataPointer->Keyboard_Key >> static_cast<uint8_t>(keyIndex) & 0x01);
+        return m_keyboardKeyStatus[static_cast<uint8_t>(keyIndex)];
     }
     KeyEvent getKeyboardKeyEvent(KeyboardKeyIndex keyIndex)
     {
@@ -695,6 +697,10 @@ public:
     }
 
 private:
+    bool isRxFrameValid(const uint8_t *data) const override;
+    void decodeControlData(const VT13OriginalRxData &rxData);
+    void updateEvent(const VT13OriginalRxData &rxData);
+    void clearEvent();
     static SwitchStatus3Pos mapModeSwitch(uint8_t raw); // 档位原始值到SwitchStatus3Pos的映射
 };
 

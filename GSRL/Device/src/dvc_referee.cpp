@@ -77,14 +77,20 @@ Referee::Referee(UART_HandleTypeDef *huartCommon,
 
 /**
  * @brief 从UART接收中断中逐字节送入数据，按状态机进行帧解包
- * @param data 接收到的数据指针
- * @param length 数据长度
+ * @param data 本段接收数据指针
+ * @param length 本段接收数据的字节数
+ * @param event UART接收事件
  * @note 本函数应在UART接收中断回调中调用
  */
-void Referee::receiveRxDataFromISR(const uint8_t *data, uint16_t length)
+void Referee::receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event)
 {
-    m_uartRxTimestamp = HAL_GetTick();
-    m_isConnected     = true;
+    if (event == UART_RX_EVENT_ERROR) {
+        m_unpackCtx.step       = UnpackStep::HEADER_SOF;
+        m_unpackCtx.index      = 0;
+        m_unpackCtx.dataLength = 0;
+        m_isConnected          = false;
+        return;
+    }
 
     for (uint16_t i = 0; i < length; i++) {
         uint8_t byte = data[i];
@@ -129,14 +135,15 @@ void Referee::receiveRxDataFromISR(const uint8_t *data, uint16_t length)
             } break;
 
             case UnpackStep::DATA_CRC16: {
-                if (m_unpackCtx.index < FRAME_MAX_SIZE) {
-                    m_unpackCtx.packetBuffer[m_unpackCtx.index++] = byte;
-                }
+                // 帧头阶段已限制整帧长度, 收齐后退出此状态
+                m_unpackCtx.packetBuffer[m_unpackCtx.index++] = byte;
                 // 帧总长度 = 帧头(5) + 命令ID(2) + 数据(dataLength) + CRC16(2)
                 uint16_t frameLength = HEADER_SIZE + CMD_ID_SIZE + m_unpackCtx.dataLength + CRC16_SIZE;
                 if (m_unpackCtx.index >= frameLength) {
                     if (CRCCalculator::verifyCRC16(m_unpackCtx.packetBuffer, frameLength)) {
                         solveFrameData(m_unpackCtx.packetBuffer);
+                        m_uartRxTimestamp = HAL_GetTick();
+                        m_isConnected     = true;
                     }
                     m_unpackCtx.step = UnpackStep::HEADER_SOF;
                 }

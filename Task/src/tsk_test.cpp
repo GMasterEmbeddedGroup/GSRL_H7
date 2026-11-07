@@ -68,7 +68,7 @@ const fp32 *quaternion;        // 四元数指针
 /* Function prototypes -------------------------------------------------------*/
 extern "C" void can1RxCallback(can_rx_message_t *pRxMsg);
 extern "C" void can2RxCallback(can_rx_message_t *pRxMsg);
-extern "C" void uart5RxCallback(uint8_t *pData, uint16_t Size); // UART5 接收回调（DR16遥控器）
+extern "C" void uart5RxCallback(uint8_t *pData, uint16_t Size, UART_RxEvent_t event); // UART5 接收回调（DR16遥控器）
 inline void transmitMotorsControlData();
 
 /* User code -----------------------------------------------------------------*/
@@ -84,10 +84,12 @@ extern "C" void test_task(void *argument)
 
     CAN_Init(&hfdcan1, can1RxCallback);
     CAN_Init(&hfdcan2, can2RxCallback);
-    UART_Init(&huart5, uart5RxCallback, 36);
+    UART_Init(&huart5, uart5RxCallback, 2 * sizeof(DR16RemoteControl::DR16OriginalRxData));
 
     TickType_t taskLastWakeTime = xTaskGetTickCount();
     while (1) {
+        dr16Remote.updateRxData(); // 本轮统一更新遥控器状态和事件
+
         // BMI088 数据读取和姿态解算
         imu.solveAttitude(); // 读取传感器数据并更新 AHRS
 
@@ -109,9 +111,6 @@ extern "C" void test_task(void *argument)
         motor_3508_3.openloopControl(0.0f);
 
         transmitMotorsControlData();
-
-        dr16Remote.decodeRxData();
-        dr16Remote.updateEvent();
 
         vTaskDelayUntil(&taskLastWakeTime, 1);
     }
@@ -145,11 +144,12 @@ extern "C" void can2RxCallback(can_rx_message_t *pRxMsg)
  * @brief UART5接收中断回调函数（DR16遥控器）
  * @param pData 接收数据指针
  * @param Size 接收数据长度
+ * @param event 数据、IDLE或错误通知
  */
-extern "C" void uart5RxCallback(uint8_t *pData, uint16_t Size)
+extern "C" void uart5RxCallback(uint8_t *pData, uint16_t Size, UART_RxEvent_t event)
 {
     // 将接收到的DR16遥控器数据传递给遥控器对象
-    dr16Remote.receiveRxDataFromISR(pData);
+    dr16Remote.receiveRxDataFromISR(pData, Size, event);
 }
 
 /**

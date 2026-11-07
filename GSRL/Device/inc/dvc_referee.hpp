@@ -542,15 +542,17 @@ public:
 
     /**
      * @brief 从UART接收中断中逐字节送入数据进行解包
-     * @param data 接收到的数据指针
-     * @param length 数据长度
+     * @param data 本段接收数据指针
+     * @param length 本段接收数据的字节数
+     * @param event UART接收事件, ERROR通知清除未完成的帧并标记断线
      * @note 本函数应在UART接收中断回调中调用
+     * @note F4库接收入口为(data, length); 本接口须传入(data, length, event)
      */
-    void receiveRxDataFromISR(const uint8_t *data, uint16_t length);
+    void receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event);
 
     /**
      * @brief 检查裁判系统是否连接
-     * @note 基于UART接收时间戳进行超时检测
+     * @note 基于有效完整帧的接收时间戳进行超时检测
      */
     bool isConnected()
     {

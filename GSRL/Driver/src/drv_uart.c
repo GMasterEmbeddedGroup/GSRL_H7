@@ -74,16 +74,17 @@ static UART_Manage_Object_t *UART_Get_Object(UART_HandleTypeDef *huart)
  * @brief 初始化UART，启动DMA接收
  * @param huart UART句柄
  * @param rxCallbackFunction 处理回调函数
- * @param rxDataLimit 空闲中断最大接收数据长度，不得超过drv_uart.h中定义的缓冲区大小UART_BUFFER_SIZE
+ * @param rxDataLimit DMA接收缓冲区长度, 范围为2至UART_BUFFER_SIZE
  */
 void UART_Init(UART_HandleTypeDef *huart, UART_Call_Back rxCallbackFunction, uint16_t rxDataLimit)
 {
+    if (rxDataLimit < 2 || rxDataLimit > UART_BUFFER_SIZE) return;
     UART_Manage_Object_t *uart_obj = UART_Get_Object(huart);
     if (uart_obj != NULL) {
         uart_obj->huart              = huart;
         uart_obj->rxDataLimit        = rxDataLimit;
         uart_obj->rxCallbackFunction = rxCallbackFunction;
-        HAL_UARTEx_ReceiveToIdle_DMA(huart, uart_obj->rxBuffer, uart_obj->rxDataLimit);
+        UART_Reinit(huart);
     }
 }
 
@@ -94,7 +95,12 @@ void UART_Init(UART_HandleTypeDef *huart, UART_Call_Back rxCallbackFunction, uin
 void UART_Reinit(UART_HandleTypeDef *huart)
 {
     UART_Manage_Object_t *uart_obj = UART_Get_Object(huart);
-    if (uart_obj != NULL) {
+    if (uart_obj != NULL && uart_obj->rxDataLimit != 0) {
+        HAL_UART_AbortReceive(huart);
+        uart_obj->rxReadPosition = 0;
+        if (uart_obj->rxCallbackFunction != NULL) {
+            uart_obj->rxCallbackFunction(NULL, 0, UART_RX_EVENT_ERROR);
+        }
         HAL_UARTEx_ReceiveToIdle_DMA(huart, uart_obj->rxBuffer, uart_obj->rxDataLimit);
     }
 }
@@ -112,18 +118,37 @@ HAL_StatusTypeDef UART_Send_Data(UART_HandleTypeDef *huart, uint8_t *pTxData, ui
 }
 
 /**
- * @brief HAL库UART接收空闲中断
+ * @brief HAL库UART接收事件回调
  * @param huart UART编号
- * @param Size 长度
- * @details 判断并调用对应的回调处理函数后重启DMA接收
+ * @param Size 触发通知时的DMA位置
+ * @details 交付尚未交付的接收字节, 跨缓冲区末尾时分两段交付; Circular接收保持运行
  */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
     UART_Manage_Object_t *uart_obj = UART_Get_Object(huart);
-    if (uart_obj != NULL) {
-        if (uart_obj->rxCallbackFunction != NULL) {
-            uart_obj->rxCallbackFunction(uart_obj->rxBuffer, Size);
+    if (uart_obj == NULL || uart_obj->rxDataLimit == 0) return;
+
+    (void)Size;
+    HAL_UART_RxEventTypeTypeDef hal_event = HAL_UARTEx_GetRxEventType(huart);
+    UART_RxEvent_t event                 = hal_event == HAL_UART_RXEVENT_IDLE ? UART_RX_EVENT_IDLE : UART_RX_EVENT_DATA;
+    // 读取当前DMA位置, 避免延迟到达的HT/TC通知将读取位置退回旧位置
+    uint16_t position = uart_obj->rxDataLimit - __HAL_DMA_GET_COUNTER(huart->hdmarx);
+    if (huart->hdmarx->Init.Mode == DMA_CIRCULAR && position == uart_obj->rxDataLimit) position = 0;
+    uint16_t previous = uart_obj->rxReadPosition;
+    uart_obj->rxReadPosition = position;
+
+    if (uart_obj->rxCallbackFunction != NULL) {
+        if (position < previous) {
+            uart_obj->rxCallbackFunction(uart_obj->rxBuffer + previous, uart_obj->rxDataLimit - previous, UART_RX_EVENT_DATA);
+            previous = 0;
         }
+        if (position != previous || event == UART_RX_EVENT_IDLE) {
+            uart_obj->rxCallbackFunction(uart_obj->rxBuffer + previous, position - previous, event);
+        }
+    }
+    if (huart->hdmarx->Init.Mode != DMA_CIRCULAR && hal_event != HAL_UART_RXEVENT_HT) {
+        // Normal接收已结束, 重新启动时不打断设备层的连续组帧状态
+        uart_obj->rxReadPosition = 0;
         HAL_UARTEx_ReceiveToIdle_DMA(huart, uart_obj->rxBuffer, uart_obj->rxDataLimit);
     }
 }
@@ -135,11 +160,5 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
  */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    UART_Manage_Object_t *uart_obj = UART_Get_Object(huart);
-    if (uart_obj != NULL) {
-        HAL_UARTEx_ReceiveToIdle_DMA(huart, uart_obj->rxBuffer, uart_obj->rxDataLimit);
-        if (uart_obj->rxCallbackFunction != NULL) {
-            uart_obj->rxCallbackFunction(NULL, 0);
-        }
-    }
+    UART_Reinit(huart);
 }

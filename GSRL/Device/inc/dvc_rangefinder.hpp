@@ -16,6 +16,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "gsrl_common.h"
+#include "drv_uart.h"
 
 /* Exported types ------------------------------------------------------------*/
 
@@ -44,6 +45,7 @@ protected:
  * @brief 北醒 TFmini Plus 激光测距传感器类
  * @note 使用UART通信，波特率115200，8N1
  * @note 使用前需确保receiveRxDataFromISR方法在对应UART接收中断服务函数中被调用
+ * @note F4库接收入口为(data, length); 本接口须传入(data, length, event), 在接收回调中完成组帧和解包
  * @note 数据帧格式: [0x59][0x59][Dist_L][Dist_H][Str_L][Str_H][Temp_L][Temp_H][Checksum]
  */
 class TFMiniPlus : public Rangefinder
@@ -55,7 +57,7 @@ public:
 private:
     static constexpr uint32_t RX_TIMEOUT_MS = 100;
 
-    const uint8_t *m_rxDataPointer; // 指向UART DMA缓冲区的指针
+    uint8_t m_rxData[FRAME_LENGTH]; // 跨UART回调组帧
     uint16_t m_rxDataLength;
     uint32_t m_lastDecodeTimestamp;
 
@@ -65,12 +67,12 @@ private:
     bool m_isConnected;
     bool m_isDataValid;  // 数据有效性: Strength >= 100 且 Strength != 65535
 
-    void decodeRxData();
+    bool decodeRxData();
 
 public:
     TFMiniPlus();
 
-    void receiveRxDataFromISR(const uint8_t *data, uint16_t length);
+    void receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event);
 
     int16_t getDistance() override;  // cm，数据无效时返回0
     uint16_t getStrength() override;

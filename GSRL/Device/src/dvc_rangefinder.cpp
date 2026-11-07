@@ -12,6 +12,7 @@
  */
 /* Includes ------------------------------------------------------------------*/
 #include "dvc_rangefinder.hpp"
+#include <cstring>
 
 /* Typedef -------------------------------------------------------------------*/
 
@@ -33,7 +34,7 @@
  * @brief 构造函数，初始化成员变量
  */
 TFMiniPlus::TFMiniPlus()
-    : m_rxDataPointer(nullptr),
+    : m_rxData{},
       m_rxDataLength(0),
       m_lastDecodeTimestamp(0),
       m_distance(0),
@@ -44,42 +45,47 @@ TFMiniPlus::TFMiniPlus()
 
 /**
  * @brief 在UART接收中断中调用，解码接收到的数据
- * @param data   DMA缓冲区指针
- * @param length 本次接收到的字节数
+ * @param data   本段接收数据指针
+ * @param length 本段接收数据的字节数
+ * @param event UART接收事件
  */
-void TFMiniPlus::receiveRxDataFromISR(const uint8_t *data, uint16_t length)
+void TFMiniPlus::receiveRxDataFromISR(const uint8_t *data, uint16_t length, UART_RxEvent_t event)
 {
-    m_rxDataPointer = data;
-    m_rxDataLength  = length;
-    decodeRxData();
+    if (event == UART_RX_EVENT_ERROR) {
+        m_rxDataLength = 0;
+        m_isConnected = m_isDataValid = false;
+        m_distance = m_strength = 0;
+        m_temperature = 0.0f;
+        return;
+    }
+    while (length != 0) {
+        uint16_t count = FRAME_LENGTH - m_rxDataLength;
+        if (count > length) count = length;
+        memcpy(m_rxData + m_rxDataLength, data, count);
+        m_rxDataLength += count;
+        data += count;
+        length -= count;
+        if (m_rxDataLength != FRAME_LENGTH) continue;
+        if (decodeRxData()) {
+            m_rxDataLength = 0;
+        } else {
+            memmove(m_rxData, m_rxData + 1, FRAME_LENGTH - 1);
+            m_rxDataLength = FRAME_LENGTH - 1;
+        }
+    }
 }
 
 /**
  * @brief 解析原始数据帧，更新距离、信号强度及传感器温度
- * @note 扫描缓冲区中最后一个合法帧；找到有效帧时更新时间戳和数据，否则直接返回
+ * @return 帧校验是否通过, 通过后更新时间戳和数据
  */
-void TFMiniPlus::decodeRxData()
+bool TFMiniPlus::decodeRxData()
 {
-    const uint8_t *pFrame = nullptr;
-    if (m_rxDataPointer != nullptr && m_rxDataLength >= FRAME_LENGTH) {
-        for (uint16_t i = 0; i <= m_rxDataLength - FRAME_LENGTH; i++) {
-            // 帧头校验
-            if (m_rxDataPointer[i] != FRAME_HEADER || m_rxDataPointer[i + 1] != FRAME_HEADER) {
-                continue;
-            }
-
-            // 校验和校验: 前8字节累加和的低8位
-            uint8_t checksum = 0;
-            for (uint8_t j = 0; j < FRAME_LENGTH - 1; j++) {
-                checksum += m_rxDataPointer[i + j];
-            }
-            if (checksum == m_rxDataPointer[i + FRAME_LENGTH - 1]) {
-                pFrame = m_rxDataPointer + i;
-            }
-        }
-    }
-
-    if (pFrame == nullptr) { return; }
+    const uint8_t *pFrame = m_rxData;
+    if (pFrame[0] != FRAME_HEADER || pFrame[1] != FRAME_HEADER) return false;
+    uint8_t checksum = 0;
+    for (uint8_t i = 0; i < FRAME_LENGTH - 1; i++) checksum += pFrame[i];
+    if (checksum != pFrame[FRAME_LENGTH - 1]) return false;
 
     // 解析数据
     m_distance       = (int16_t)((uint16_t)pFrame[2] | ((uint16_t)pFrame[3] << 8));
@@ -93,6 +99,7 @@ void TFMiniPlus::decodeRxData()
     // 更新连接状态和时间戳
     m_lastDecodeTimestamp = HAL_GetTick();
     m_isConnected         = true;
+    return true;
 }
 
 /**
